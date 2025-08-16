@@ -1,12 +1,86 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
-import re, shutil, logging
+
+import re
+import json
+import shutil
+import logging
+import subprocess
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-from config import CONFIG
-from probe import probe_duration_seconds
+
 from naming import parse_name_year
-from utils import ensure_dir
+
+
+# Parameter
+TRAILER_MAX      = 240
+EPISODE_MIN      = 18*60
+EPISODE_MAX      = 65*60
+TINY_FILE_BYTES  = 100 * 1024 * 1024
+EP_TOL           = 0.15
+DOUBLE_TOL       = 0.12
+PLAYALL_MIN_X    = 3.0
+PLAYALL_SOFT_X   = 2.7
+PLAYALL_TOL_MIN  = 240
+PLAYALL_TOL_MAX  = 480
+SIZE_TOL         = 0.22  # Fallback über Größe
+
+
+def _probe_duration_seconds(p: Path, log: logging.Logger) -> float:
+    ff = "ffprobe"
+    if shutil.which(ff):
+        try:
+            res = subprocess.run(
+                [ff, "-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", str(p)],
+                capture_output=True, text=True, timeout=30, encoding="utf-8", errors="replace"
+            )
+            if res.returncode == 0 and res.stdout.strip():
+                return float(res.stdout.strip())
+        except Exception as e:
+            log.debug(f"ffprobe Fehler {p}: {e}")
+    mi = "mediainfo"
+    if shutil.which(mi):
+        try:
+            res = subprocess.run([mi, "--Output=JSON", str(p)], capture_output=True, text=True, timeout=30, encoding="utf-8", errors="replace")
+            if res.returncode == 0 and res.stdout.strip():
+                data = json.loads(res.stdout)
+                tracks = data.get("media", {}).get("track", [])
+                for t in tracks:
+                    if t.get("@type") == "General":
+                        dur = t.get("Duration")
+                        if dur:
+                            val = float(dur)
+                            return val/1000.0 if val > 10000 else val
+        except Exception as e:
+            log.debug(f"mediainfo Fehler {p}: {e}")
+    return -1.0
+
+
+def _median(values: List[float]) -> float:
+    s = sorted(values); n = len(s)
+    if n == 0: return 0.0
+    m = n // 2
+    return (s[m-1] + s[m]) / 2.0 if n % 2 == 0 else s[m]
+
+
+def _near(value: float, target: float, tol_abs_min: float, tol_abs_max: float) -> bool:
+    base_tol = max(tol_abs_min, min(tol_abs_max, target * 0.12))
+    return abs(value - target) <= base_tol
+
+
+def _is_playall(dur: float, ep_med: float, remaining_total: Optional[int]) -> bool:
+    if ep_med <= 0 or dur <= 0:
+        return False
+    if dur >= PLAYALL_MIN_X * ep_med:
+        return True
+    if remaining_total is not None and remaining_total > 4 and dur >= PLAYALL_SOFT_X * ep_med:
+        return True
+    for k in (3, 4, 5, 6, 7, 8):
+        if _near(dur, k * ep_med, PLAYALL_TOL_MIN, PLAYALL_TOL_MAX):
+            if remaining_total is None or remaining_total >= k:
+                return True
+    return False
+
 
 def _extract_title_index(fname: str) -> int:
     m = re.search(r"[^\d](\d{1,3})\.mkv$", fname)
@@ -16,40 +90,6 @@ def _extract_title_index(fname: str) -> int:
     m = re.search(r"(\d{1,3})\.mkv$", fname)
     return int(m.group(1)) if m else 9999
 
-def _durations_for_files(files: List[Path], log: logging.Logger) -> Dict[Path, float]:
-    d: Dict[Path, float] = {}
-    for f in files:
-        dur = probe_duration_seconds(f, log)
-        d[f] = dur if dur is not None else -1.0
-        try:
-            size = f.stat().st_size
-        except FileNotFoundError:
-            size = -1
-        log.debug(f"Dauer {f.name}: {d[f]} s  | Größe: {size} B")
-    return d
-
-def _median(values: List[float]) -> float:
-    s = sorted(values); n = len(s)
-    if n == 0: return 0.0
-    mid = n // 2
-    return (s[mid-1] + s[mid]) / 2.0 if n % 2 == 0 else s[mid]
-
-def _near(value: float, target: float, tol_abs_min: float, tol_abs_max: float) -> bool:
-    base_tol = max(tol_abs_min, min(tol_abs_max, target * 0.12))
-    return abs(value - target) <= base_tol
-
-def _is_playall(dur: float, ep_med: float, remaining_total: Optional[int]) -> bool:
-    if ep_med <= 0 or dur <= 0: 
-        return False
-    if dur >= CONFIG["BEHAVIOR"]["PLAYALL_FACTOR_MIN"] * ep_med:
-        return True
-    if remaining_total is not None and remaining_total > 4 and dur >= CONFIG["BEHAVIOR"]["PLAYALL_FACTOR_SOFT"] * ep_med:
-        return True
-    for k in (3, 4, 5, 6, 7, 8):
-        if _near(dur, k * ep_med, CONFIG["BEHAVIOR"]["PLAYALL_MULT_TOL_MIN"], CONFIG["BEHAVIOR"]["PLAYALL_MULT_TOL_MAX"]):
-            if remaining_total is None or remaining_total >= k:
-                return True
-    return False
 
 def rename_and_move_tv(
     tmp_out: Path,
@@ -60,35 +100,36 @@ def rename_and_move_tv(
     expected_total_eps: Optional[int],
     is_last_disc: bool,
     log: logging.Logger,
+    dry_run: bool = False,
 ) -> Tuple[bool, int]:
+
     files = sorted(tmp_out.glob("*.mkv"), key=lambda p: (_extract_title_index(p.name), p.name))
     if not files:
         log.error(f"Keine MKVs in {tmp_out}.")
         return False, start_episode_no
 
     name, year, version = parse_name_year(base_display)
-    ensure_dir(dest_base)
+    dest_base.mkdir(parents=True, exist_ok=True)
 
-    durations = _durations_for_files(files, log)
-    TR   = CONFIG["BEHAVIOR"]["TRAILER_MAX"]
-    EP_MIN = CONFIG["BEHAVIOR"]["EPISODE_MIN"]
-    EP_MAX = CONFIG["BEHAVIOR"]["EPISODE_MAX"]
-    TINY  = CONFIG["BEHAVIOR"]["TINY_FILE_BYTES"]
-    tol   = CONFIG["BEHAVIOR"]["EPISODE_TOLERANCE"]
-    dtol  = CONFIG["BEHAVIOR"]["DOUBLE_EP_TOL"]
-    size_tol = CONFIG["BEHAVIOR"]["SIZE_TOLERANCE"]
+    durations: Dict[Path, float] = {}
+    sizes: Dict[Path, int] = {}
+    for f in files:
+        durations[f] = _probe_duration_seconds(f, log)
+        try:
+            sizes[f] = f.stat().st_size
+        except Exception:
+            sizes[f] = -1
+        log.debug(f"Dauer {f.name}: {durations[f]} s | Größe: {sizes[f]} B")
 
-    sizes = {f: (f.stat().st_size if f.exists() else -1) for f in files}
-
-    candidates = [durations[f] for f in files
-                  if durations.get(f, -1.0) >= EP_MIN and durations.get(f, -1.0) <= EP_MAX
-                  and sizes.get(f, -1) >= TINY]
+    # Kandidaten für Dauer-Median
+    candidates = [durations[f] for f in files if EPISODE_MIN <= durations.get(f, -1.0) <= EPISODE_MAX and sizes.get(f, -1) >= TINY_FILE_BYTES]
     ep_med = _median(candidates) if candidates else 0.0
-    lo, hi = (ep_med*(1.0 - tol), ep_med*(1.0 + tol)) if ep_med > 0 else (0.0, 0.0)
+    lo, hi = (ep_med*(1.0-EP_TOL), ep_med*(1.0+EP_TOL)) if ep_med > 0 else (0.0, 0.0)
 
-    size_candidates = [sizes[f] for f in files if sizes.get(f, -1) >= TINY]
+    # Größen-Fallback
+    size_candidates = [sizes[f] for f in files if sizes.get(f, -1) >= TINY_FILE_BYTES]
     size_med = float(_median(size_candidates)) if size_candidates else 0.0
-    slo, shi = (size_med*(1.0 - size_tol), size_med*(1.0 + size_tol)) if size_med > 0 else (0.0, 0.0)
+    slo, shi = (size_med*(1.0-SIZE_TOL), size_med*(1.0+SIZE_TOL)) if size_med > 0 else (0.0, 0.0)
 
     remaining_total = None
     if expected_total_eps is not None:
@@ -98,12 +139,12 @@ def rename_and_move_tv(
         f"Episoden-Median: {ep_med:.1f}s | Fenster: [{lo:.1f}, {hi:.1f}] | "
         f"Größen-Median: {size_med/1024/1024/1024:.2f} GiB | Fenster: [{slo/1024/1024/1024:.2f}, {shi/1024/1024/1024:.2f}] GiB | "
         f"Start-Episode: {start_episode_no:02d} | Erwartet gesamt: {expected_total_eps} | "
-        f"Verbleibend: {remaining_total} | Letzte Disc: {is_last_disc} | Modus: {'SIZE' if (ep_med<=0 or len(candidates)<max(1,len(files)//3)) else 'DURATION'}"
+        f"Verbleibend: {remaining_total} | Letzte Disc: {is_last_disc}"
     )
 
     def mv(src: Path, dst: Path):
-        ensure_dir(dst.parent)
-        if CONFIG["BEHAVIOR"]["DRY_RUN"]:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if dry_run:
             log.info(f"[DRY-RUN] Move: {src} -> {dst}")
         else:
             shutil.move(str(src), str(dst))
@@ -117,33 +158,28 @@ def rename_and_move_tv(
     use_size_fallback = (ep_med <= 0) or (len(candidates) < max(1, len(files)//3))
 
     for f in files:
-        dur  = durations.get(f, -1.0)
+        dur = durations.get(f, -1.0)
         size = sizes.get(f, -1)
-        tiny = size >= 0 and size < TINY
+        tiny = size >= 0 and size < TINY_FILE_BYTES
 
-        # 1) Trailer-Erkennung
-        is_trailer = (dur >= 0 and dur <= TR) or (tiny and dur > 0 and dur <= EP_MIN*0.6)
+        # 1) Trailer
+        is_trailer = (dur >= 0 and dur <= TRAILER_MAX) or (tiny and dur > 0 and dur <= EPISODE_MIN*0.6)
 
         if use_size_fallback:
             # 2) Größenbasiert
-            is_episode   = (not tiny) and (size_med > 0) and (size >= slo and size <= shi)
-            is_double_ep = (not tiny) and (size_med > 0) and (size >= (2.0 - dtol) * size_med and size <= (2.0 + dtol) * size_med)
-            playall      = (not tiny) and (size_med > 0) and (size >= CONFIG["BEHAVIOR"]["PLAYALL_FACTOR_MIN"] * size_med)
+            is_episode   = (not tiny) and (size_med > 0) and (slo <= size <= shi)
+            is_double_ep = (not tiny) and (size_med > 0) and ((2.0-DOUBLE_TOL)*size_med <= size <= (2.0+DOUBLE_TOL)*size_med)
+            playall      = (not tiny) and (size_med > 0) and (size >= PLAYALL_MIN_X * size_med)
         else:
             # 2) Dauerbasiert
-            is_episode   = (dur >= lo and dur <= hi) and not tiny
-            is_double_ep = not tiny and dur > hi and dur >= (2.0 - dtol) * ep_med and dur <= (2.0 + dtol) * ep_med
+            is_episode   = (lo <= dur <= hi) and not tiny
+            is_double_ep = (not tiny) and dur > hi and ((2.0-DOUBLE_TOL)*ep_med <= dur <= (2.0+DOUBLE_TOL)*ep_med)
             playall      = _is_playall(dur, ep_med, remaining_total)
 
-        # Letzte Disc: Doppel-Folgen bevorzugen, kein Play-All, wenn <=4 fehlen
-        if is_last_disc and remaining_total is not None and remaining_total <= 4:
-            if is_double_ep:
-                playall = False
+        if is_last_disc and remaining_total is not None and remaining_total <= 4 and is_double_ep:
+            playall = False
 
-        log.debug(
-            f"Classify: {f.name} | dur={dur:.1f}s | size={size} | tiny={tiny} | "
-            f"episode={is_episode} | double={is_double_ep} | trailer={is_trailer} | playall?={playall}"
-        )
+        log.debug(f"Classify: {f.name} | dur={dur:.1f}s | size={size} | tiny={tiny} | episode={is_episode} | double={is_double_ep} | trailer={is_trailer} | playall?={playall} | mode={'SIZE' if use_size_fallback else 'DURATION'}")
 
         if playall and not is_episode and not is_double_ep:
             mv(f, dest_base / f"{name} [bonusmaterial] - playall.mkv")
@@ -186,7 +222,7 @@ def rename_and_move_tv(
             success_any = True
 
     try:
-        if not CONFIG["BEHAVIOR"]["DRY_RUN"]:
+        if not dry_run:
             shutil.rmtree(tmp_out, ignore_errors=True)
     except Exception:
         pass

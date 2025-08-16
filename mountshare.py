@@ -1,29 +1,13 @@
 # -*- coding: utf-8 -*-
-"""
-Hilfsfunktionen für das Arbeiten mit dem Netzlaufwerk/Share.
-
-Stellt die Funktionen bereit, die in main.py importiert werden:
-- is_windows()
-- ensure_dir(Path)
-- get_share_root(logger)  -> Path | None
-- delete_path(Path, logger)
-
-Environment-Variablen (optional):
-- BLICKFELD_UNC_ROOT      z.B. \\\\blickfeldData\\downloads
-- BLICKFELD_WIN_DRIVE     z.B. K:   (Default: K:)
-- BLICKFELD_LINUX_MOUNT   z.B. /mnt/blickfeldData (Default: /mnt/blickfeldData)
-- BLICKFELD_SMB_USER
-- BLICKFELD_SMB_PASS
-- BLICKFELD_MAP           "1" => unter Windows per `net use` verbinden (wenn UNC+Creds da sind)
-"""
-
 from __future__ import annotations
+
 import os
+import shlex
 import shutil
-import subprocess
 import logging
+import subprocess
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional
 
 
 def is_windows() -> bool:
@@ -34,94 +18,77 @@ def ensure_dir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
 
 
-# ---- interne Helfer ---------------------------------------------------------
-
-def _parse_unc(unc: str) -> Tuple[str, str]:
-    unc = unc.strip().lstrip("\\")
-    parts = unc.split("\\")
+def _parse_unc(unc: str) -> tuple[str, str]:
+    # \\server\share
+    if not unc.startswith("\\\\"):
+        raise ValueError(f"Ungültiger UNC-Root: {unc}")
+    parts = unc.strip("\\").split("\\", 2)
     if len(parts) < 2:
-        raise ValueError(f"Ungültiger UNC-Pfad: {unc!r}")
+        raise ValueError(f"Ungültiger UNC-Root: {unc}")
     return parts[0], parts[1]
 
 
-def _net_use_map(drive: str, unc: str, user: str, pwd: str, log: logging.Logger) -> Optional[Path]:
-    """Versucht unter Windows das Netzlaufwerk zu mappen."""
+def _mount_windows(unc_root: str, drive: str, user: str, pwd: str, log: logging.Logger, dry_run: bool) -> Optional[Path]:
     drive = drive.rstrip("\\/")
     try:
-        # Altes Mapping entfernen (ignorieren, wenn nicht vorhanden)
-        subprocess.run(
-            ["net", "use", drive, "/delete", "/y"],
-            capture_output=True, text=True, encoding="utf-8", errors="replace"
-        )
-        cmd = ["net", "use", drive, unc, pwd, "/user:" + user, "/persistent:no"]
-        log.info(f"Mappe Netzlaufwerk: {' '.join(cmd)}")
-        res = subprocess.run(
-            cmd, capture_output=True, text=True, encoding="utf-8", errors="replace"
-        )
-        if res.returncode != 0:
-            log.error(f"net use fehlgeschlagen ({res.returncode}): {res.stdout}\n{res.stderr}")
-            return None
+        subprocess.run(["net", "use", drive, "/delete", "/y"], capture_output=True, text=True, encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+    cmd = ["net", "use", drive, unc_root, pwd, "/user:" + user, "/persistent:no"]
+    if dry_run:
+        log.info(f"[DRY-RUN] net use: {' '.join(cmd)}")
         return Path(drive + "\\")
-    except Exception as e:
-        log.exception(f"Windows Netzlaufwerk Fehler: {e}")
+    log.info(f"Mappe Netzlaufwerk: {' '.join(cmd)}")
+    res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if res.returncode != 0:
+        log.error(f"net use fehlgeschlagen ({res.returncode}): {res.stdout}\n{res.stderr}")
         return None
+    return Path(drive + "\\")  # K:\
 
 
-# ---- Public API -------------------------------------------------------------
-
-def get_share_root(log: logging.Logger) -> Optional[Path]:
-    """
-    Liefert die Basis des Shares zurück.
-
-    Logik:
-    - Windows:
-        - Wenn BLICKFELD_MAP == "1" und UNC + USER + PASS vorhanden ⇒ `net use` Mapping versuchen.
-        - Sonst nur das Laufwerk zurückgeben (Default K:\).
-    - Linux:
-        - Gibt den Mountpoint zurück (Default /mnt/blickfeldData). Ein automatisches Mounten
-          wird hier NICHT versucht.
-    """
-    unc = os.environ.get("BLICKFELD_UNC_ROOT", r"\\blickfeldData\downloads")
-    win_drive = os.environ.get("BLICKFELD_WIN_DRIVE", "K:")
-    linux_mp = os.environ.get("BLICKFELD_LINUX_MOUNT", "/mnt/blickfeldData")
-    want_map = os.environ.get("BLICKFELD_MAP", "0") == "1"
-
-    if is_windows():
-        base = Path(win_drive + "\\")
-        if want_map:
-            user = os.environ.get("BLICKFELD_SMB_USER")
-            pwd = os.environ.get("BLICKFELD_SMB_PASS")
-            if user and pwd and unc:
-                mapped = _net_use_map(win_drive, unc, user, pwd, log)
-                if mapped:
-                    return mapped
-        # Fallback: nur Laufwerk zurückgeben
-        return base
-    else:
-        return Path(linux_mp)
+def _mount_linux(unc_root: str, mount_point: str, user: str, pwd: str, log: logging.Logger, dry_run: bool) -> Optional[Path]:
+    server, share = _parse_unc(unc_root)
+    mp = Path(mount_point); ensure_dir(mp)
+    opts = f"username={user},password={pwd},vers=3.0,iocharset=utf8,dir_mode=0775,file_mode=0664"
+    cmd = ["mount", "-t", "cifs", f"//{server}/{share}", str(mp), "-o", opts]
+    if dry_run:
+        log.info(f"[DRY-RUN] mount CIFS: {' '.join(shlex.quote(x) for x in cmd)}")
+        return mp
+    log.info(f"Mount CIFS: {' '.join(shlex.quote(x) for x in cmd)}")
+    res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if res.returncode != 0:
+        log.error(f"mount fehlgeschlagen ({res.returncode}): {res.stdout}\n{res.stderr}")
+        return None
+    return mp
 
 
-def delete_path(p: Path, log: logging.Logger) -> None:
-    """
-    Löscht Datei/Link/Ordner rekursiv. Existiert der Pfad nicht, wird geloggt und beendet.
-    """
+def get_share_root(
+    log: logging.Logger,
+    enable_mount: bool,
+    unc_root: str,
+    win_drive_letter: str,
+    linux_mount_point: str,
+    username: str,
+    password: str,
+    dry_run: bool = False,
+) -> Optional[Path]:
+    if enable_mount:
+        return _mount_windows(unc_root, win_drive_letter, username, password, log, dry_run) if is_windows() \
+            else _mount_linux(unc_root, linux_mount_point, username, password, log, dry_run)
+    return Path(win_drive_letter + "\\") if is_windows() else Path(linux_mount_point)
+
+
+def delete_path(p: Path, log: logging.Logger, dry_run: bool = False) -> None:
+    if dry_run:
+        log.info(f"[DRY-RUN] Löschen: {p}")
+        return
     try:
-        if not p.exists():
-            log.info(f"Löschen übersprungen – Pfad existiert nicht: {p}")
-            return
         if p.is_file() or p.is_symlink():
             p.unlink(missing_ok=True)
             log.info(f"Datei gelöscht: {p}")
         elif p.is_dir():
+            import shutil
             shutil.rmtree(p, ignore_errors=True)
             log.info(f"Ordner gelöscht: {p}")
-        else:
-            # Unbekannter Typ – trotzdem versuchen
-            try:
-                p.unlink(missing_ok=True)
-                log.info(f"Pfad gelöscht: {p}")
-            except Exception:
-                shutil.rmtree(p, ignore_errors=True)
-                log.info(f"Pfad rekursiv gelöscht: {p}")
     except Exception as e:
-        log.exception(f"Löschen fehlgeschlagen für {p}: {e}")
+        log.warning(f"Konnte {p} nicht löschen: {e}")

@@ -3,6 +3,7 @@ __pycache__/
 **/__pycache__/          # <- sichert wirklich alle Unterordner
 *.py[cod]
 *$py.class
+*.pyc
 
 # Envs & Tools
 .env

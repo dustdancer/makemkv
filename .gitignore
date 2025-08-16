@@ -1,24 +1,42 @@
-# Secrets & Env
-secrets.txt
-*.env
-.env*
-
 # Python
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
+*$py.class
 
-# Logs / Temp
-logs/
-*_auslesen.txt
-*_remux.txt
-remux/_tmp/
-tmp/
-.cache/
+# Envs & Tools
+.env
+.venv/
+venv/
+.env.* 
+pip-wheel-metadata/
 
-# OS / IDE
-.DS_Store
-Thumbs.db
+# IDE/Editor
 .vscode/
 .idea/
+*.code-workspace
+
+# Logs, temp & outputs
+logs/
+*.log
+*.tmp
+tmp/
+_temp/
+cache/
+
+# Dein Projekt
+secrets.txt
+secrets-*.txt
+!secrets.example.txt           # Beispiel darf versioniert werden
+data/usenet/complete/iso/logs/
+data/usenet/complete/iso/remux/
+# Falls du transcode/ remux nur auf dem Share hast, brauchst du diese Zeilen nicht
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Windows/VS Artefakte
+*.user
+*.suo
+*.VC.db
+*.VC.VC.opendb

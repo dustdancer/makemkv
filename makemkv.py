@@ -1,47 +1,112 @@
-# -*- coding: utf-8 -*-
+# makemkv.py
 from __future__ import annotations
-import shutil, shlex, logging, subprocess, re
+
+import logging
+import shlex
+import shutil
+import subprocess
 from pathlib import Path
 from typing import Optional, Tuple
-from config import CONFIG
-from logui import ConsoleUI
+
 
 def find_makemkvcon(log: logging.Logger) -> Optional[str]:
-    import os
-    if os.name == "nt":
-        for p in CONFIG["MAKEMKV"]["WIN_PATHS"]:
-            if Path(p).exists():
-                log.info(f"MakeMKV gefunden: {p}")
-                return p
-        log.warning("MakeMKV-CLI nicht gefunden (Windows). Pfade in CONFIG prüfen.")
-        return None
-    p = shutil.which(CONFIG["MAKEMKV"]["LINUX_PATH"]) or CONFIG["MAKEMKV"]["LINUX_PATH"]
+    """
+    Sucht die MakeMKV-CLI (bevorzugt 64-bit).
+    """
+    win_paths = [
+        r"C:\Program Files (x86)\MakeMKV\makemkvcon64.exe",
+        r"C:\Program Files\MakeMKV\makemkvcon64.exe",
+        r"C:\Program Files (x86)\MakeMKV\makemkvcon.exe",
+        r"C:\Program Files\MakeMKV\makemkvcon.exe",
+    ]
+    for p in win_paths:
+        if Path(p).exists():
+            log.info(f"MakeMKV gefunden: {p}")
+            return p
+    # Linux / PATH
+    p = shutil.which("makemkvcon") or "makemkvcon"
     if shutil.which(p) or Path(p).exists():
         log.info(f"MakeMKV gefunden: {p}")
         return p
-    log.warning("makemkvcon nicht im PATH (Linux). CONFIG['MAKEMKV']['LINUX_PATH'] setzen.")
+
+    log.warning("MakeMKV-CLI nicht gefunden. Pfad prüfen.")
     return None
 
-def _parse_prgv(line: str) -> Optional[Tuple[int, int]]:
-    """PRGV:<job>,<cur>,<total> → (cur,total)"""
-    if not line.startswith("PRGV:"): return None
-    try:
-        parts = line.strip().split(":")[1].split(",")
-        if len(parts) >= 3:
-            return int(parts[1]), int(parts[2])
-    except Exception:
-        pass
-    return None
 
-def _parse_total_titles(line: str) -> Optional[int]:
+def _resolve_disc_folder(src: Path) -> Path:
     """
-    MSG:5014,...,"5 Titel werden in Verzeichnis file://... gespeichert"
+    Nimmt einen beliebigen Pfad (Datei oder Ordner) entgegen und liefert einen
+    Pfad zurück, der für makemkvcon 'file:' gültig ist.
+
+    Fälle:
+      - …\BDMV  -> bleibt BDMV
+      - …\VIDEO_TS -> bleibt VIDEO_TS
+      - …\DiscOrdner\BDMV / VIDEO_TS -> wechsle in den jeweiligen Unterordner
+      - …\IrgendeineDatei (z.B. DSNS1D5 ohne Endung) -> gehe zum Elternordner
+        und suche dort BDMV/VIDEO_TS
+      - …\DiscOrdner mit index.bdmv / VIDEO_TS.IFO im Ordner -> nutze diesen Ordner
     """
-    m = re.search(r'MSG:5014[^"]*"(\d+)\s+Titel', line)
-    if m:
-        try: return int(m.group(1))
-        except: return None
-    return None
+    p = src
+
+    # Wenn Datei (kein ISO): erst zum Elternordner
+    if p.is_file() and p.suffix.lower() != ".iso":
+        p = p.parent
+
+    # Bereits auf dem Unterordner?
+    name = p.name.upper()
+    if name == "BDMV" or name == "VIDEO_TS":
+        return p
+
+    # Enthält der Ordner direkt Disc-Struktur?
+    if (p / "BDMV").is_dir():
+        return p / "BDMV"
+    if (p / "VIDEO_TS").is_dir():
+        return p / "VIDEO_TS"
+
+    # Manche Rips haben index.bdmv / VIDEO_TS.IFO direkt im Ordner
+    if (p / "index.bdmv").exists():
+        return p
+    if (p / "VIDEO_TS.IFO").exists():
+        return p
+
+    # Ein Level höher probieren (falls z.B. …\BDMV\STREAM übergeben wurde)
+    parent = p.parent
+    if parent and parent.is_dir():
+        if parent.name.upper() in ("BDMV", "VIDEO_TS"):
+            return parent
+        if (parent / "BDMV").is_dir():
+            return parent / "BDMV"
+        if (parent / "VIDEO_TS").is_dir():
+            return parent / "VIDEO_TS"
+
+    return p  # Fallback: unverändert zurückgeben
+
+
+def _build_input_spec(source_kind: str, source_path: Path, log: logging.Logger) -> Tuple[str, Path]:
+    """
+    Baut (kind, path) für makemkvcon auf. Korrigiert ungünstige Eingaben:
+    - Wenn 'file:' aber Ordner ist Disc-Root ohne BDMV/VIDEO_TS -> in Unterordner wechseln
+    - Wenn 'file:' aber eine "komische" Datei (z.B. ohne Endung) -> Elternordner prüfen
+    - Wenn .iso-Datei -> 'iso:' verwenden
+    """
+    kind = source_kind
+    p = source_path
+
+    # ISO-Datei?
+    if p.is_file() and p.suffix.lower() == ".iso":
+        return "iso", p
+
+    if kind != "iso":
+        resolved = _resolve_disc_folder(p)
+        if resolved != p:
+            try:
+                log.debug(f"Quellpfad angepasst: {p} -> {resolved}")
+            except Exception:
+                pass
+        return "file", resolved
+
+    return "iso", p
+
 
 def run_makemkv(
     makemkv: str,
@@ -49,23 +114,24 @@ def run_makemkv(
     source_path: Path,
     out_dir: Path,
     log: logging.Logger,
-    ui: Optional[ConsoleUI] = None,
-    disc_index: Optional[int] = None,
-    disc_total: Optional[int] = None,
+    ui=None,
+    extra_opts: Optional[list] = None,
 ) -> bool:
+    """
+    Führt makemkvcon aus. Akzeptiert 'source_kind' = 'iso' oder 'file'.
+    Korrigiert typische Eingabefehler (Ordner auf Disc-Root statt BDMV/VIDEO_TS, Dateien ohne Endung, …).
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
-    if ui is None:
-        ui = ConsoleUI(True)
-    extra = CONFIG["MAKEMKV"]["EXTRA_OPTS"] or []
-    input_spec = f"iso:{str(source_path)}" if source_kind == "iso" else f"file:{str(source_path)}"
-    cmd = [makemkv, "mkv"] + extra + [input_spec, "all", str(out_dir)]
-    log.info(f"MakeMKV: {' '.join(shlex.quote(x) for x in cmd)}")
-    if CONFIG["BEHAVIOR"]["DRY_RUN"]:
-        log.info("[DRY-RUN] MakeMKV nicht ausgeführt.")
-        return True
 
-    track_total: Optional[int] = None
-    last_bar_cur, last_bar_total = 0, 0
+    kind, resolved_src = _build_input_spec(source_kind, source_path, log)
+
+    # Standard: --robot (kann bei Bedarf erweitert werden)
+    opts = list(extra_opts) if extra_opts else ["--robot"]
+    input_spec = f"{kind}:{str(resolved_src)}"
+    cmd = [makemkv, "mkv"] + opts + [input_spec, "all", str(out_dir)]
+
+    log.info(f"MakeMKV: {' '.join(shlex.quote(x) for x in cmd)}")
+
     try:
         with subprocess.Popen(
             cmd,
@@ -74,53 +140,32 @@ def run_makemkv(
             text=True,
             encoding="utf-8",
             errors="replace",
-            bufsize=1
+            bufsize=1,
         ) as proc:
-            while True:
-                line = proc.stdout.readline() if proc.stdout else ""
-                if not line:
-                    break
-                s = line.rstrip("\r\n")
-                log.debug(s)
-
-                # total tracks?
-                if track_total is None:
-                    maybe = _parse_total_titles(s)
-                    if maybe:
-                        track_total = maybe
-
-                # progress?
-                pr = _parse_prgv(s)
-                if pr:
-                    last_bar_cur, last_bar_total = pr
-                    # bereits erzeugte MKVs zählen
-                    done_tracks = len(list(out_dir.glob("*.mkv")))
-                    suffix = []
-                    if track_total is not None:
-                        suffix.append(f"Tracks {done_tracks}/{track_total}")
-                    if disc_index is not None and disc_total is not None:
-                        suffix.append(f"Disc {disc_index}/{disc_total}")
-                    ui.bar(f"Remux: {source_path.name}", pr[0], pr[1], " | ".join(suffix))
-                else:
-                    # spinner mit den selben infos
-                    done_tracks = len(list(out_dir.glob("*.mkv")))
-                    suffix = []
-                    if track_total is not None:
-                        suffix.append(f"Tracks {done_tracks}/{track_total}")
-                    if disc_index is not None and disc_total is not None:
-                        suffix.append(f"Disc {disc_index}/{disc_total}")
-                    ui.spin(f"Remux läuft: {source_path.name}", " | ".join(suffix))
-
+            for line in proc.stdout or []:
+                if ui is not None:
+                    try:
+                        ui.spin(f"Remux läuft: {resolved_src.name}")
+                    except Exception:
+                        pass
+                log.debug(line.rstrip("\r\n"))
             rc = proc.wait()
-        ui.done()
+
         if rc != 0:
-            log.error(f"MakeMKV Returncode {rc} – Quelle: {source_path}")
+            # 10 wird von MakeMKV oft als "fatal error" / Quelle ungültig gemeldet
+            if rc == 10:
+                log.error(
+                    "MakeMKV Returncode 10 – Prüfe bitte, ob auf einen gültigen Disc-Ordner "
+                    "(BDMV/VIDEO_TS) oder eine .iso-Datei verwiesen wird."
+                )
+            else:
+                log.error(f"MakeMKV Returncode {rc} – Quelle: {resolved_src}")
             return False
-        # falls nie PRGV kam, trotzdem “Done” visualisiert
-        if last_bar_total == 0:
-            ui.done()
+
         return True
+    except FileNotFoundError:
+        log.error("makemkvcon nicht gefunden/ausführbar – Pfad prüfen.")
+        return False
     except Exception as e:
-        ui.done()
         log.exception(f"Fehler beim MakeMKV-Aufruf: {e}")
         return False

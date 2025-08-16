@@ -1,4 +1,3 @@
-# file: makemkv_auto/__init__.py
-__all__ = [
-    "main",
-]
+# -*- coding: utf-8 -*-
+# mark this directory as a module (optional for direct script use)
+__all__ = ["main"]

@@ -1,150 +1,80 @@
-# file: makemkv/rename_movie.py
+# -*- coding: utf-8 -*-
 from __future__ import annotations
-
-"""
-Umbenennen & Verschieben für Filme.
-
-Heuristik:
-- Hauptfilm = längste (bekannte) Laufzeit; bei unbekannter Laufzeit: größte Datei
-- Trailer = Dauer <= TRAILER_MAX (Standard 240s) ODER sehr kleine Datei (TINY_FILE_BYTES)
-- Rest → Bonusmaterial (extra01/extra02/…)
-- Optionales Suffix in Klammern (Version/Edition) wird in den Hauptfilm-Namen übernommen.
-
-API:
-    rename_and_move_movie(tmp_out, dest_base, base_display, log) -> bool
-"""
-
-import shutil
+import shutil, logging
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import List, Dict
+from config import CONFIG
+from probe import probe_duration_seconds
+from naming import parse_name_year
+from utils import ensure_dir
 
-from .config import CONFIG
-from .probe import durations_for_files
-from .naming import parse_name_year, sanitize_filename
-from .utils import ensure_dir  # erwartet ensure_dir(Path) in utils.py
-
-
-__all__ = ["rename_and_move_movie"]
-
-
-def _sizes_for_files(files: List[Path]) -> Dict[Path, int]:
-    sizes: Dict[Path, int] = {}
+def _durations_for_files(files: List[Path], log: logging.Logger) -> Dict[Path, float]:
+    d: Dict[Path, float] = {}
     for f in files:
+        dur = probe_duration_seconds(f, log)
+        d[f] = dur if dur is not None else -1.0
         try:
-            sizes[f] = f.stat().st_size
+            size = f.stat().st_size
         except FileNotFoundError:
-            sizes[f] = -1
-    return sizes
+            size = -1
+        log.debug(f"Dauer {f.name}: {d[f]} s  | Größe: {size} B")
+    return d
 
-
-def _unique_path(dst: Path) -> Path:
-    """Hänge (n) an, falls Datei bereits existiert."""
-    if not dst.exists():
-        return dst
-    stem, ext = dst.stem, dst.suffix
-    i = 1
-    while True:
-        cand = dst.with_name(f"{stem} ({i}){ext}")
-        if not cand.exists():
-            return cand
-        i += 1
-
-
-def _move(src: Path, dst: Path, log) -> None:
-    ensure_dir(dst.parent)
-    if CONFIG["BEHAVIOR"].get("DRY_RUN", False):
-        log.info(f"[DRY-RUN] Move: {src} -> {dst}")
-        return
-    dst = _unique_path(dst)
-    shutil.move(str(src), str(dst))
-    log.info(f"Verschoben: {src.name} -> {dst}")
-
-
-def rename_and_move_movie(tmp_out: Path, dest_base: Path, base_display: str, log) -> bool:
-    """
-    Verschiebt alle MKVs aus tmp_out nach dest_base gemäß Movie-Heuristik.
-
-    :param tmp_out:   temporärer MakeMKV-Ausgabeordner (enthält *.mkv)
-    :param dest_base: endgültiger Zielordner (z. B. …/remux/movies/<Titel (Jahr)>)
-    :param base_display: Anzeigename/Quelle (z. B. Ordner-/ISO-Name)
-    :param log:       Logger
-    :return: True, wenn etwas verschoben wurde
-    """
+def rename_and_move_movie(tmp_out: Path, dest_base: Path, base_display: str, log: logging.Logger) -> bool:
     files = sorted(tmp_out.glob("*.mkv"))
     if not files:
         log.error(f"Keine MKVs in {tmp_out}.")
         return False
 
-    # Zielordner anlegen
+    name, year, version = parse_name_year(base_display)
     ensure_dir(dest_base)
 
-    # Titelmetadaten aus dem Anzeigenamen ableiten
-    name, year, version = parse_name_year(base_display)
-    title_base = name  # Jahr wird im Ordner geführt, nicht im Dateinamen
-    main_name = f"{title_base}.mkv" if not version else f"{title_base} [{version}].mkv"
+    durations = _durations_for_files(files, log)
+    # Sortierung: Dauer absteigend (unbekannt=-1 ans Ende), dann Größe absteigend, dann Name
+    files_sorted = sorted(
+        files,
+        key=lambda p: (
+            durations.get(p, -1.0) if durations.get(p, -1.0) >= 0 else float("-inf"),
+            -p.stat().st_size if p.exists() else 0,
+            p.name,
+        ),
+        reverse=True,
+    )
 
-    # Laufzeiten & Größen ermitteln
-    durations = durations_for_files(files, log)  # -1.0, wenn unbekannt
-    sizes = _sizes_for_files(files)
+    TR = CONFIG["BEHAVIOR"]["TRAILER_MAX"]
+    main_done = False; trailer_counter = 1; bonus_counter = 1; ok = False
 
-    # Sortierschlüssel: 1) bekannte Dauer absteigend, 2) Größe absteigend, 3) Name
-    def sort_key(p: Path) -> Tuple[float, int, str]:
-        d = durations.get(p, -1.0)
-        d_key = d if d is not None and d >= 0 else -1.0  # unbekannt = -1
-        s_key = sizes.get(p, -1)
-        return (d_key, s_key, p.name)
-
-    files_sorted = sorted(files, key=sort_key, reverse=True)
-
-    # Schwellwerte
-    TR = CONFIG["BEHAVIOR"]["TRAILER_MAX"]             # Sekunden
-    TINY = CONFIG["BEHAVIOR"]["TINY_FILE_BYTES"]       # Bytes
-
-    moved_any = False
-    main_done = False
-    trailer_counter = 1
-    bonus_counter = 1
-
-    # Kandidat für Hauptfilm ist immer das erste Element der sortierten Liste
-    # (längste bekannte Laufzeit; sonst größte Datei)
-    for idx, f in enumerate(files_sorted):
-        dur = float(durations.get(f, -1.0))
-        size = sizes.get(f, -1)
-        is_tiny = size >= 0 and size < TINY
-        is_trailer = (dur >= 0 and dur <= TR) or (is_tiny and 0 < dur <= TR * 2)
-
-        if not main_done and idx == 0:
-            # Hauptfilm
-            _move(f, dest_base / main_name, log)
-            main_done = True
-            moved_any = True
-            continue
-
-        if is_trailer:
-            # Trailer
-            suffix = f"-{trailer_counter}" if trailer_counter > 1 else ""
-            _move(f, dest_base / f"{title_base}_trailer{suffix}.mkv", log)
-            trailer_counter += 1
-            moved_any = True
+    def mv(src: Path, dst: Path):
+        ensure_dir(dst.parent)
+        if CONFIG["BEHAVIOR"]["DRY_RUN"]:
+            log.info(f"[DRY-RUN] Move: {src} -> {dst}")
         else:
-            # Bonusmaterial
-            _move(f, dest_base / f"{title_base} [bonusmaterial] - extra{bonus_counter:02d}.mkv", log)
-            bonus_counter += 1
-            moved_any = True
+            shutil.move(str(src), str(dst))
+            log.info(f"Verschoben: {src.name} -> {dst}")
 
-    # Falls unser "Hauptfilm" nicht plausibel war (z. B. einziger Track extrem klein)
-    # → Fallback: trackNN für alle (Reihenfolge beibehalten)
+    for idx, f in enumerate(files_sorted):
+        dur = durations.get(f, -1.0)
+        is_trailer = dur >= 0 and dur <= TR
+        if not main_done and (idx == 0) and (dur < 0 or dur >= 45*60):
+            tgt_name = f"{name}.mkv" if not version else f"{name} [{version}].mkv"
+            mv(f, dest_base / tgt_name)
+            main_done = True; ok = True
+        elif is_trailer:
+            mv(f, dest_base / f"{name}_trailer{('-' + str(trailer_counter)) if trailer_counter > 1 else ''}.mkv")
+            trailer_counter += 1; ok = True
+        else:
+            mv(f, dest_base / f"{name} [bonusmaterial] - extra{bonus_counter:02d}.mkv")
+            bonus_counter += 1; ok = True
+
     if not main_done:
         log.warning("Kein plausibler Hauptfilm – Fallback trackNN.")
-        for i, f in enumerate(files_sorted, 1):
-            _move(f, dest_base / f"{title_base} track{i:02d}.mkv", log)
-            moved_any = True
+        for idx, f in enumerate(files_sorted):
+            mv(f, dest_base / f"{name} track{idx+1:02d}.mkv")
+            ok = True
 
-    # tmp-Ordner aufräumen (best effort)
-    if not CONFIG["BEHAVIOR"].get("DRY_RUN", False):
-        try:
+    try:
+        if not CONFIG["BEHAVIOR"]["DRY_RUN"]:
             shutil.rmtree(tmp_out, ignore_errors=True)
-        except Exception:
-            pass
-
-    return moved_any
+    except Exception:
+        pass
+    return ok

@@ -1,0 +1,7 @@
+# Secrets & lokale Konfig
+secrets.txt
+*.secret
+*.key
+*.pem
+.env
+.env.*

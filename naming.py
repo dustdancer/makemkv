@@ -1,36 +1,82 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+Naming-/Parsing-Helfer für das MakeMKV-Remux-Projekt.
 
+Enthält:
+- sanitize_filename
+- extract_season
+- extract_disc_no
+- parse_name_year
+- fallback_series_info  ← robust gegenüber Path-Objekten
+"""
 from __future__ import annotations
-
-import os
 import re
-import json
-import logging
 from pathlib import Path
-from typing import Optional, Tuple, Dict
+from typing import Optional, Tuple, Union
 
-# -----------------------
-# Filename / String utils
-# -----------------------
 
 def sanitize_filename(name: str) -> str:
+    """Macht einen string dateisystemtauglich (ohne Sonderzeichen/Mehrfachspaces)."""
     name = name.strip()
-    name = re.sub(r"[\\/:\*\?\"<>\|\x00-\x1F]", "_", name)
+    name = re.sub(r'[\\/:\*\?"<>\|\x00-\x1F]', "_", name)
     name = re.sub(r"\s+", " ", name)
-    return name.strip().rstrip("._-")
+    return name.strip().rstrip("._- ")
+
+
+def extract_season(s: str) -> Optional[int]:
+    """
+    Extrahiert eine Staffelnummer aus einem String.
+    Erlaubt u.a.:
+      - 'Staffel 1', 'Season 02', 'S01', 's1'
+    """
+    m = re.search(r"(?i)\bStaffel\s*(\d{1,2})\b", s)
+    if m:
+        return int(m.group(1))
+    m = re.search(r"(?i)\bSeason\s*(\d{1,2})\b", s)
+    if m:
+        return int(m.group(1))
+    m = re.search(r"(?i)\bS(?:eason)?\s*[_\-\.\s]?(\d{1,2})\b", s)
+    if m:
+        return int(m.group(1))
+    return None
+
+
+def extract_disc_no(s: str) -> Optional[int]:
+    """
+    Extrahiert eine Disc-/DVD-Nummer aus einem String.
+    Erlaubt u.a.:
+      - 'Disc 1', 'Disk 2', 'DVD 3', 'DvD 4', 'D 5', 'D5', 'S1D2'
+    """
+    s = s.replace("_", " ")
+    patterns = [
+        r"(?i)\bDisc\s*(\d{1,2})\b",
+        r"(?i)\bDisk\s*(\d{1,2})\b",
+        r"(?i)\bDVD\s*(\d{1,2})\b",
+        r"(?i)\bDvD\s*(\d{1,2})\b",
+        r"(?i)\bD\s*(\d{1,2})\b",
+        r"(?i)\bD(\d{1,2})\b",
+        r"(?i)\bS\d{1,2}D(\d{1,2})\b",
+        r"(?i)\bCD\s*(\d{1,2})\b",
+    ]
+    for pat in patterns:
+        m = re.search(pat, s)
+        if m:
+            try:
+                return int(m.group(1))
+            except Exception:
+                pass
+    return None
+
 
 def parse_name_year(base: str) -> Tuple[str, Optional[str], Optional[str]]:
     """
-    Extrahiert (Name, Jahr, Version) aus einem Basis-String.
-    Beispiele:
-      "Blade Runner (1982) [Final Cut]" -> ("Blade Runner", "1982", "Final Cut")
-      "Star Trek - DS9" -> ("Star Trek - DS9", None, None)
+    Zerlegt 'Titel (1999) [Version]' in (Titel, Jahr, Version).
+    Klammern werden entfernt und Titel sanitiziert.
     """
     name = base
     version = None
 
-    mver = re.search(r"\[(.+?)\]", base)
+    mver = re.search(r"\[(.+?)\]", name)
     if mver:
         version = mver.group(1).strip()
         name = re.sub(r"\s*\[.+?\]\s*", " ", name).strip()
@@ -43,135 +89,56 @@ def parse_name_year(base: str) -> Tuple[str, Optional[str], Optional[str]]:
     name = sanitize_filename(name)
     return name, year, version
 
-def extract_season(s: str) -> Optional[int]:
-    """
-    Sucht nach Sxx / Season xx in Strings.
-    """
-    m = re.search(r"[Ss](?:eason)?\s*[_\-\.\s]?(\d{1,2})", s)
-    if m:
-        return int(m.group(1))
-    m = re.search(r"\bS(\d{1,2})\b", s)
-    return int(m.group(1)) if m else None
 
-def extract_disc_no(s: str) -> Optional[int]:
+def _clean_series_base(series_base: str) -> str:
     """
-    Sucht nach Disc/Disk/D/CD/…-Nummern und Mustern wie S01D02.
+    Entfernt Staffel-/Disc-Tokens aus einem Serien-Basisnamen.
     """
-    s = s.replace("_", " ")
-    patterns = [
-        r"\bdisc\s*(\d{1,2})\b",
-        r"\bdisk\s*(\d{1,2})\b",
-        r"\bd\s*(\d{1,2})\b",
-        r"\bD(\d{1,2})\b",
-        r"\bCD\s*(\d{1,2})\b",
-        r"\bS\d{1,2}D(\d{1,2})\b",
-        r"\bDisc(\d{1,2})\b",
-        r"\bDisk(\d{1,2})\b",
-    ]
-    for pat in patterns:
-        m = re.search(pat, s, re.IGNORECASE)
-        if m:
-            try:
-                return int(m.group(1))
-            except Exception:
-                pass
-    return None
+    s = series_base
 
-def fallback_series_info(series_base: str) -> Tuple[str, Optional[str]]:
+    # SxxDyy-Kombis zuerst
+    s = re.sub(r"(?i)\bS\d{1,2}D\d{1,2}\b", "", s)
+
+    # Staffel/Season
+    s = re.sub(r"(?i)\bStaffel\s*\d{1,2}\b", "", s)
+    s = re.sub(r"(?i)\bSeason\s*\d{1,2}\b", "", s)
+    s = re.sub(r"(?i)\bS(?:eason)?\s*[_\-\.\s]?\d{1,2}\b", "", s)
+
+    # Disc/Disk/DVD/DvD/D/ D##
+    s = re.sub(r"(?i)\bDisc\s*\d{1,2}\b", "", s)
+    s = re.sub(r"(?i)\bDisk\s*\d{1,2}\b", "", s)
+    s = re.sub(r"(?i)\bDVD\s*\d{1,2}\b", "", s)
+    s = re.sub(r"(?i)\bDvD\s*\d{1,2}\b", "", s)
+    s = re.sub(r"(?i)\bD\s*\d{1,2}\b", "", s)
+    s = re.sub(r"(?i)\bD\d{1,2}\b", "", s)
+
+    # Mehrfach-Trenner/Spaces normalisieren
+    s = re.sub(r"[ \t\-_.]+", " ", s)
+    return sanitize_filename(s).strip()
+
+
+def fallback_series_info(item_root: Union[str, Path]) -> Tuple[str, Optional[int], Optional[int]]:
     """
-    Entfernt offensichtliche Disc/Season-Tokens und extrahiert (Serienname, Jahr-Hinweis).
+    Liefert (Serienname_ohne_Tokens, Staffel, Disc) aus einem Ordnernamen/F Pfad.
+    Robuste Annahmen für DS9-Beispiele wie:
+      - 'Star Trek - Deep Space Nine Staffel 1 DvD 1'
+      - 'STDSNS1D2'
+      - 'DSNS6D4'
+    Akzeptiert Path-Objekte oder Strings (fix für TypeError bei re.sub).
     """
-    cleaned = re.sub(r"\bS\d{1,2}D\d{1,2}\b", "", series_base, flags=re.IGNORECASE)
-    cleaned = re.sub(r"\b[Dd]isc\s*\d{1,2}\b", "", cleaned)
-    cleaned = re.sub(r"\b[Dd](\d{1,2})\b", "", cleaned)
-    cleaned = re.sub(r"\b[Ss](?:eason)?\s*\d{1,2}\b", "", cleaned)
-    cleaned = re.sub(r"\s+", " ", cleaned).strip()
-    name, year, _ = parse_name_year(cleaned)
-    return name, year
+    # Robust in Path wandeln
+    p = item_root if isinstance(item_root, Path) else Path(str(item_root))
+    series_base = p.name
+    parent_name = p.parent.name
 
-# -----------------------
-# Zielpfade
-# -----------------------
+    # Saison / Disc aus Basis *oder* Parent ziehen (falls Infos im Elternordner stehen)
+    season = extract_season(series_base) or extract_season(parent_name) or None
+    disc = extract_disc_no(series_base) or extract_disc_no(parent_name) or None
 
-def destination_for_movie(remux_root: Path, base: str) -> Path:
-    name, year, _ = parse_name_year(base)
-    dir_name = f"{name} ({year})" if year else name
-    return Path(remux_root) / "movies" / dir_name
+    # Seriennamen bereinigen (Tokens entfernen)
+    cleaned = _clean_series_base(series_base)
+    if not cleaned:
+        # Fallback: Elternnamen säubern
+        cleaned = _clean_series_base(parent_name)
 
-def destination_for_tv(remux_root: Path, base: str, season_no: Optional[int]) -> Path:
-    """
-    Ordnerstruktur: tv/<Serienname (Jahr)>/season 01
-    """
-    name, year, _ = parse_name_year(base)
-    series_dir = f"{name} ({year})" if year else name
-    season_dir = f"season {season_no:02d}" if season_no is not None else "season ??"
-    return Path(remux_root) / "tv" / series_dir / season_dir
-
-# -----------------------
-# TMDb Helfer
-# -----------------------
-
-def tmdb_is_enabled() -> bool:
-    return bool(os.environ.get("TMDB_API_KEY", "").strip())
-
-def _http_get_json(url: str, params: Dict[str, str], timeout: int = 8) -> Optional[Dict]:
-    """
-    Kleiner urllib-Wrapper ohne externe Abhängigkeiten.
-    """
-    try:
-        from urllib.request import Request, urlopen
-        from urllib.parse import urlencode
-    except Exception:
-        return None
-
-    try:
-        q = urlencode(params)
-        req = Request(url + ("?" + q if q else ""), headers={"Accept": "application/json"})
-        with urlopen(req, timeout=timeout) as resp:
-            data = resp.read().decode("utf-8", errors="replace")
-            return json.loads(data)
-    except Exception:
-        return None
-
-def tmdb_search_tv_id(series_name: str, year_hint: Optional[str], log: Optional[logging.Logger] = None) -> Optional[int]:
-    api = os.environ.get("TMDB_API_KEY", "").strip()
-    if not api:
-        return None
-    base = "https://api.themoviedb.org/3/search/tv"
-    params = {
-        "api_key": api,
-        "language": "de-DE",
-        "query": series_name,
-    }
-    if year_hint and year_hint.isdigit():
-        params["first_air_date_year"] = year_hint
-    data = _http_get_json(base, params, timeout=8)
-    if not data or not data.get("results"):
-        if log:
-            log.debug("TMDb: keine Treffer in search/tv")
-        return None
-    results = data["results"]
-    for r in results:
-        if r.get("name", "").lower() == series_name.lower():
-            return r.get("id")
-    return results[0].get("id")
-
-def tmdb_get_season_episode_count(series_name: str, year_hint: Optional[str], season_no: Optional[int], log: Optional[logging.Logger] = None) -> Optional[int]:
-    """
-    Angleichen an main.py-Aufruf: (series_name, year_hint, season_no, log)
-    """
-    if season_no is None:
-        return None
-    api = os.environ.get("TMDB_API_KEY", "").strip()
-    if not api:
-        return None
-    sid = tmdb_search_tv_id(series_name, year_hint, log)
-    if not sid:
-        return None
-    base = f"https://api.themoviedb.org/3/tv/{sid}/season/{season_no}"
-    params = {"api_key": api, "language": "de-DE"}
-    data = _http_get_json(base, params, timeout=8)
-    if not data:
-        return None
-    eps = data.get("episodes")
-    return len(eps) if isinstance(eps, list) else None
+    return cleaned, season, disc

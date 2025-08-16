@@ -1,5 +1,6 @@
 # Python
 __pycache__/
+**/__pycache__/          # <- sichert wirklich alle Unterordner
 *.py[cod]
 *$py.class
 
@@ -7,12 +8,19 @@ __pycache__/
 .env
 .venv/
 venv/
-.env.* 
+.env.*
 pip-wheel-metadata/
+.poetry/
+pip-cache/
+.mypy_cache/
+.pytest_cache/
+.pytype/
+.ipynb_checkpoints/
 
 # IDE/Editor
 .vscode/
 .idea/
+.vs/
 *.code-workspace
 
 # Logs, temp & outputs
@@ -22,6 +30,9 @@ logs/
 tmp/
 _temp/
 cache/
+dist/
+build/
+*.egg-info/
 
 # Dein Projekt
 secrets.txt

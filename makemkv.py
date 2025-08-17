@@ -13,8 +13,14 @@ from config import CONFIG
 # Optional: Wenn du eine Konsolen-Progress-UI hast, wird sie genutzt.
 try:
     from logui import ConsoleUI  # type: ignore
-except Exception:  # Fallback wenn nicht vorhanden
-    ConsoleUI = None  # type: ignore
+except Exception:
+    # Fallback-Stub, damit Typ-Hints wie Optional[ConsoleUI] gültig sind
+    class ConsoleUI:  # type: ignore
+        def bar(self, *args, **kwargs) -> None:
+            pass
+
+        def done(self) -> None:
+            pass
 
 
 def find_makemkvcon(log: logging.Logger) -> Optional[str]:
@@ -101,7 +107,7 @@ def run_makemkv(
     source_path: Path,
     out_dir: Path,
     log: logging.Logger,
-    ui: Optional["ConsoleUI"] = None,
+    ui: Optional[ConsoleUI] = None,
 ) -> bool:
     """
     Führt den eigentlichen Remux-Aufruf aus. Nutzt _build_input_spec(), um

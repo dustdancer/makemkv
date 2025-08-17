@@ -1,144 +1,139 @@
 # -*- coding: utf-8 -*-
+"""
+Loader + Logger-Setup
+- YAML laden und in einfache Objekte mit Attributzugriff mappen
+- Stage-Logger (AUSLESEN | REMUX | RENAME) + Pipeline-Log
+"""
+
 from __future__ import annotations
-from dataclasses import dataclass
+import logging
 from pathlib import Path
-from typing import Optional
+from types import SimpleNamespace
+from datetime import datetime, timedelta
 import yaml
 
-# --------- Datamodel ---------
 
-@dataclass
-class AppCfg:
-    log_level: str = "INFO"
-    dry_run: bool = True
+def _to_namespace(d):
+    if isinstance(d, dict):
+        return SimpleNamespace(**{k: _to_namespace(v) for k, v in d.items()})
+    if isinstance(d, list):
+        return [ _to_namespace(x) for x in d ]
+    return d
 
-@dataclass
-class PathsCfg:
-    base_root: Path = Path(".")
-    transcode_dir: Path = Path("./transcode")
-    remux_dir: Path = Path("./remux")
-    logs_dir: Path = Path("./logs")
 
-@dataclass
-class MakeMKVCfg:
-    win_paths: list[str] = None
-    linux_path: str = "makemkvcon"
-    extra_opts: list[str] = None
+def _coerce_paths(cfg_ns):
+    # Pfade in Path konvertieren
+    cfg_ns.paths.base_root   = Path(cfg_ns.paths.base_root)
+    cfg_ns.paths.transcode_dir = Path(cfg_ns.paths.transcode_dir)
+    cfg_ns.paths.remux_dir   = Path(cfg_ns.paths.remux_dir)
+    cfg_ns.paths.logs_dir    = Path(cfg_ns.paths.logs_dir)
+    # MakeMKV Listen sicherstellen
+    if not isinstance(cfg_ns.makemkv.win_paths, list):
+        cfg_ns.makemkv.win_paths = [str(cfg_ns.makemkv.win_paths)]
+    if not isinstance(cfg_ns.makemkv.extra_opts, list):
+        cfg_ns.makemkv.extra_opts = [str(cfg_ns.makemkv.extra_opts)]
+    return cfg_ns
 
-@dataclass
-class BehaviorCfg:
-    delete_originals: bool = False
-    minlength_seconds: int = 300
-    trailer_max_seconds: int = 240
-    episode_min_seconds: int = 1080
-    episode_max_seconds: int = 3900
-    log_retention_days: int = 14
 
-@dataclass
-class TMDbCfg:
-    enabled: bool = False
-    language: str = "de-DE"
-    timeout_seconds: int = 8
+def load_config() -> SimpleNamespace:
+    # config/config.yaml relativ zu Projektwurzel
+    here = Path(__file__).resolve()
+    cfg_path = here.parents[2] / "config" / "config.yaml"
+    if not cfg_path.exists():
+        raise FileNotFoundError(f"Konfigurationsdatei nicht gefunden: {cfg_path}")
 
-@dataclass
-class ProbeCfg:
-    prefer_ffprobe: bool = True
-    ffprobe_path: str = "ffprobe"
-    mediainfo_path: str = "mediainfo"
+    data = yaml.safe_load(cfg_path.read_text(encoding="utf-8", errors="replace"))
+    cfg = _to_namespace(data)
 
-@dataclass
-class HooksCfg:
-    mkv_match_enabled: bool = False
-    mkv_match_binary: str = "mkv-match"
-    mkv_match_extra_args: list[str] = None
-    mkv_match_rename_to_schema: bool = True
+    # Defaults absichern
+    if not hasattr(cfg, "behavior"):
+        cfg.behavior = SimpleNamespace()
+    if not hasattr(cfg.behavior, "delete_originals"):
+        cfg.behavior.delete_originals = False
 
-@dataclass
-class Config:
-    app: AppCfg
-    paths: PathsCfg
-    makemkv: MakeMKVCfg
-    behavior: BehaviorCfg
-    tmdb: TMDbCfg
-    probe: ProbeCfg
-    hooks: HooksCfg
+    # TMDb enabled ableiten, wenn Key gesetzt (falls in YAML disabled)
+    if hasattr(cfg, "tmdb"):
+        if getattr(cfg.tmdb, "enabled", False) and not getattr(cfg.tmdb, "timeout_seconds", None):
+            cfg.tmdb.timeout_seconds = 8
+        if not getattr(cfg.tmdb, "enabled", False):
+            # falls jemand API-Key gesetzt hat, trotzdem enabled lassen? Wir respektieren das YAML-Feld.
+            pass
 
-# --------- Loader ---------
+    cfg = _coerce_paths(cfg)
 
-def _as_path(v: str | Path) -> Path:
-    return v if isinstance(v, Path) else Path(v)
+    # Log-Level normalisieren
+    lvl = str(getattr(cfg.app, "log_level", "INFO")).upper()
+    if lvl not in ("DEBUG", "INFO", "WARNING", "ERROR"):
+        lvl = "INFO"
+    cfg.app.log_level = lvl
 
-def load_config(path: str | Path = "config/config.yaml") -> Config:
-    with open(path, "r", encoding="utf-8") as f:
-        raw = yaml.safe_load(f) or {}
+    return cfg
 
-    # app
-    app_raw = raw.get("app", {}) or {}
-    app = AppCfg(
-        log_level=str(app_raw.get("log_level", "INFO")).upper(),
-        dry_run=bool(app_raw.get("dry_run", True)),
-    )
 
-    # paths
-    p_raw = raw.get("paths", {}) or {}
-    paths = PathsCfg(
-        base_root=_as_path(p_raw.get("base_root", ".")),
-        transcode_dir=_as_path(p_raw.get("transcode_dir", "./transcode")),
-        remux_dir=_as_path(p_raw.get("remux_dir", "./remux")),
-        logs_dir=_as_path(p_raw.get("logs_dir", "./logs")),
-    )
+class _StageFilter(logging.Filter):
+    def __init__(self, stage: str):
+        super().__init__()
+        self.stage = stage
 
-    # makemkv
-    mk_raw = raw.get("makemkv", {}) or {}
-    mk = MakeMKVCfg(
-        win_paths=list(mk_raw.get("win_paths", [])),
-        linux_path=str(mk_raw.get("linux_path", "makemkvcon")),
-        extra_opts=list(mk_raw.get("extra_opts", []) or []),
-    )
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.stage = self.stage
+        return True
 
-    # behavior
-    b_raw = raw.get("behavior", {}) or {}
-    behavior = BehaviorCfg(
-        delete_originals=bool(b_raw.get("delete_originals", False)),
-        minlength_seconds=int(b_raw.get("minlength_seconds", 300)),
-        trailer_max_seconds=int(b_raw.get("trailer_max_seconds", 240)),
-        episode_min_seconds=int(b_raw.get("episode_min_seconds", 1080)),
-        episode_max_seconds=int(b_raw.get("episode_max_seconds", 3900)),
-        log_retention_days=int(b_raw.get("log_retention_days", 14)),
-    )
 
-    # tmdb
-    t_raw = raw.get("tmdb", {}) or {}
-    tmdb = TMDbCfg(
-        enabled=bool(t_raw.get("enabled", False)),
-        language=str(t_raw.get("language", "de-DE")),
-        timeout_seconds=int(t_raw.get("timeout_seconds", 8)),
-    )
+def _make_logger(name: str, stage: str, file_path: Path, level: int, pipeline_handler: logging.Handler) -> logging.Logger:
+    lg = logging.getLogger(stage)  # bewusst: Stage als Name
+    lg.handlers.clear()
+    lg.setLevel(level)
 
-    # probe
-    pr_raw = raw.get("probe", {}) or {}
-    probe = ProbeCfg(
-        prefer_ffprobe=bool(pr_raw.get("prefer_ffprobe", True)),
-        ffprobe_path=str(pr_raw.get("ffprobe_path", "ffprobe")),
-        mediainfo_path=str(pr_raw.get("mediainfo_path", "mediainfo")),
-    )
+    fmt = logging.Formatter("%(asctime)s | %(levelname)-8s | %(stage)s | %(message)s", "%Y-%m-%d %H:%M:%S")
 
-    # hooks
-    hk_raw = raw.get("hooks", {}) or {}
-    mm_raw = hk_raw.get("mkv_match", {}) or {}
-    hooks = HooksCfg(
-        mkv_match_enabled=bool(mm_raw.get("enabled", False)),
-        mkv_match_binary=str(mm_raw.get("binary", "mkv-match")),
-        mkv_match_extra_args=list(mm_raw.get("extra_args", []) or []),
-        mkv_match_rename_to_schema=bool(mm_raw.get("rename_to_schema", True)),
-    )
+    fh = logging.FileHandler(file_path, encoding="utf-8")
+    fh.setLevel(level)
+    fh.setFormatter(fmt)
+    fh.addFilter(_StageFilter(stage))
 
-    return Config(
-        app=app,
-        paths=paths,
-        makemkv=mk,
-        behavior=behavior,
-        tmdb=tmdb,
-        probe=probe,
-        hooks=hooks,
-    )
+    sh = logging.StreamHandler()
+    sh.setLevel(level)
+    sh.setFormatter(fmt)
+    sh.addFilter(_StageFilter(stage))
+
+    pipeline_handler.addFilter(_StageFilter(stage))
+
+    lg.addHandler(fh)
+    lg.addHandler(sh)
+    lg.addHandler(pipeline_handler)
+
+    return lg
+
+
+def setup_stage_loggers(logs_dir: Path, log_level: str = "INFO"):
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y-%m-%d-%H-%M")
+
+    auslesen_path = logs_dir / f"{ts}_auslesen.txt"
+    remux_path    = logs_dir / f"{ts}_remux.txt"
+    rename_path   = logs_dir / f"{ts}_rename.txt"
+    pipeline_path = logs_dir / f"{ts}_pipeline.txt"
+
+    level = getattr(logging, (log_level or "INFO").upper(), logging.INFO)
+
+    fmt = logging.Formatter("%(asctime)s | %(levelname)-8s | %(stage)s | %(message)s", "%Y-%m-%d %H:%M:%S")
+    pipeline_handler = logging.FileHandler(pipeline_path, encoding="utf-8")
+    pipeline_handler.setLevel(level)
+    pipeline_handler.setFormatter(fmt)
+
+    auslesen = _make_logger("auslesen", "AUSLESEN", auslesen_path, level, pipeline_handler)
+    remux    = _make_logger("remux",    "REMUX",    remux_path,    level, pipeline_handler)
+    rename   = _make_logger("rename",   "RENAME",   rename_path,   level, pipeline_handler)
+
+    # Logrotation (einfach: alte *.txt > retention löschen)
+    keep_days =  int(14)
+    for f in logs_dir.glob("*.txt"):
+        try:
+            age = datetime.now() - datetime.fromtimestamp(f.stat().st_mtime)
+            if age > timedelta(days=keep_days):
+                f.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    return auslesen, remux, rename, pipeline_path

@@ -3,6 +3,15 @@ Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 
 Das Format folgt grob [Keep a Changelog]. Versionierung nach [SemVer].
 
+## [0.0.3] - 2025-08-17
+### Added
+- **Config-Loader + Validator** (Pydantic): lädt `config/config.yaml`, mapt Defaults, liest `config/secrets.txt` (TMDB_API_KEY, optional SMB_*), normalisiert Pfade.
+- `src/config/schema.py` (Pydantic-Modelle) und `src/config/loader.py` (Lade-/Validierungslogik).
+- `requirements.txt` um `pydantic` und `PyYAML` ergänzt.
+
+### Changed
+- `config_example.yaml` auf neutrale Platzhalterpfade (`C:\path\to\...`) korrigiert.
+
 ## [0.0.2] - 2025-08-17
 ### Added
 - Repository-Grundgerüst: `.gitignore`, `.gitattributes`

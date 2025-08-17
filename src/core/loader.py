@@ -5,24 +5,23 @@ Config-Loader + Validator (Pydantic v2)
 - Liest YAML:            ./config/config.yaml
 - Liest Secrets:         ./config/secrets.txt  (Format KEY=VALUE)
 - Merged Secrets/ENV:    TMDB_API_KEY (optional), SMB_USER/SMB_PASS (optional)
-- Normalisiert Pfade:    relative -> relativ zu base_root; Back-/Forward-Slashes ok
+- Normalisiert Pfade:    relative -> relativ zu base_root; ~ und %ENV% erlaubt
 - Optional: Pfad-Existenz prüfen/erstellen (logs/remux)
 
-Hinweis Versionierung:
-Diese Datei wurde erstmals in v0.0.3 hinzugefügt.
+Diese Datei ist die **einzige** Loader-Implementierung. Bitte alle
+Duplikate wie `config_loader.py`/`loader.py` außerhalb dieses Pfads entfernen.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import os
-import re
 import sys
-
 import yaml  # PyYAML
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
 
 # -------------------------
 # Secrets parsing (einfach)
@@ -107,23 +106,28 @@ class BehaviorConfig(BaseModel):
     delete_originals: bool = True
     dry_run: bool = False
     log_retention_days: int = 14
-    minlength_seconds: int = 60  # optional für MakeMKV --minlength
-    trailer_max_seconds: int = 240  # <= 4 min als Trailer behandeln
+    minlength_seconds: int = 60           # optional für MakeMKV --minlength
+    trailer_max_seconds: int = 240        # <= 4 min als Trailer behandeln
 
 
 class TMDbConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
-    enabled: bool = True  # wird final aus api_key abgeleitet
+    enabled: bool = True                  # wird final aus api_key abgeleitet
     api_key: str = ""
     lang: str = "de-DE"
     timeout: int = 8
 
     @model_validator(mode="after")
     def _derive_enabled(self) -> "TMDbConfig":
-        # enabled = True nur wenn Schlüssel vorhanden
         self.enabled = bool(self.api_key)
         return self
+
+
+class ValidationConfig(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    strict_path_check: bool = False       # wenn True: transcode_dir muss existieren
 
 
 class AppConfig(BaseModel):
@@ -136,8 +140,9 @@ class AppConfig(BaseModel):
     makemkv: MakeMKVConfig = Field(default_factory=MakeMKVConfig)
     behavior: BehaviorConfig = Field(default_factory=BehaviorConfig)
     tmdb: TMDbConfig = Field(default_factory=TMDbConfig)
+    validation: ValidationConfig = Field(default_factory=ValidationConfig)
 
-    # Optional mitgeführt (nicht zwingend genutzt – nur erreichbar):
+    # Optional mitgeführt (nur erreichbar):
     smb_user: Optional[str] = None
     smb_pass: Optional[str] = None
 
@@ -159,6 +164,7 @@ def _default_config_candidates() -> List[Path]:
     fällt zurück auf Pfad relativ zu diesem Modul.
     """
     here = Path(__file__).resolve()
+    # repo_root_guess: /src/config/loader.py -> repo root ist parents[2]
     repo_root_guess = here.parents[2] if len(here.parents) >= 3 else here.parent
     return [
         Path.cwd() / "config" / "config.yaml",
@@ -210,11 +216,11 @@ def load_config(
     smb_pass = (smb_pass_env or secrets.get("SMB_PASS") or "").strip() or None
 
     # 3) Rohdaten in unser Schema einsortieren
-    #    (wir erlauben in YAML z. B. keys "paths", "behavior", "tmdb", "makemkv")
-    paths_raw = raw.get("paths") or {}
-    makemkv_raw = raw.get("makemkv") or {}
+    paths_raw    = raw.get("paths") or {}
+    makemkv_raw  = raw.get("makemkv") or {}
     behavior_raw = raw.get("behavior") or {}
-    tmdb_raw = raw.get("tmdb") or {}
+    tmdb_raw     = raw.get("tmdb") or {}
+    validation   = raw.get("validation") or {}
 
     # API-Key von secrets/env überschreibt YAML
     if tmdb_key:
@@ -227,6 +233,7 @@ def load_config(
         makemkv=MakeMKVConfig(**makemkv_raw),
         behavior=BehaviorConfig(**behavior_raw),
         tmdb=TMDbConfig(**tmdb_raw),
+        validation=ValidationConfig(**validation),
         smb_user=smb_user,
         smb_pass=smb_pass,
     )
@@ -236,14 +243,10 @@ def load_config(
         cfg.paths.logs_dir.mkdir(parents=True, exist_ok=True)
         cfg.paths.remux_dir.mkdir(parents=True, exist_ok=True)
 
-    if check_path_existence:
+    if check_path_existence or cfg.validation.strict_path_check:
         # transcode_dir sollte existieren (sonst gibt's nichts zu tun)
         if not cfg.paths.transcode_dir.exists():
             raise ValueError(f"transcode_dir existiert nicht: {cfg.paths.transcode_dir}")
-        # base_root muss nicht zwingend existieren, aber oft sinnvoll
-        if not cfg.paths.base_root.exists():
-            # kein harter Fehler – nur Hinweis
-            print(f"[WARN] base_root existiert nicht: {cfg.paths.base_root}", file=sys.stderr)
 
     return cfg
 

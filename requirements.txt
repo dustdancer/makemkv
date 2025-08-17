@@ -1,8 +1,10 @@
-
 PyYAML>=6.0.1
+pydantic>=2.7
 requests>=2.32.3
 rich>=13.7.1
 psutil>=5.9.8
 watchdog>=4.0.0
-# Optional/Hook:
-# mkv-episode-matcher>=0.7  # nur falls du den Hook nutzen möchtest
+# Optional/CLI-Komfort:
+click>=8.1
+# Optional/Hook (nur wenn du den Hook nutzt):
+# mkv-episode-matcher>=0.7

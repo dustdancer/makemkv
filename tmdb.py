@@ -1,7 +1,17 @@
-# tmdb.py
-# Kleiner Adapter: re-exportiert Funktionen aus tmdb_client,
-# damit main.py weiter "from tmdb import ..." verwenden kann.
+# -*- coding: utf-8 -*-
+"""
+Shim-Modul: Stellt die bisher aus 'tmdb' importierten Funktionen bereit,
+leitet intern an tmdb_client weiter. So muss main.py nicht angefasst werden.
+"""
 
-from tmdb_client import tmdb_is_enabled, tmdb_get_season_episode_count
+from tmdb_client import (
+    tmdb_is_enabled,
+    tmdb_get_season_episode_count,
+    tmdb_search_tv_id,
+)
 
-__all__ = ["tmdb_is_enabled", "tmdb_get_season_episode_count"]
+__all__ = [
+    "tmdb_is_enabled",
+    "tmdb_get_season_episode_count",
+    "tmdb_search_tv_id",
+]

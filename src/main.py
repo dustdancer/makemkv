@@ -1,88 +1,86 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Main-Teststarter für Logger + Scanner.
-
-- Lädt config/config.yaml (über core.loader.load_config)
-- Richtet Logging ein (utils.logger.setup_loggers)
-- Führt einen Scan auf transcode_dir aus (core.scanner.find_sources)
-- Protokolliert gefundene Quellen sauber in den Logs
-
-Start:
-  python -m src.main
-oder (zur Not):
-  python src/main.py
-"""
-
 from __future__ import annotations
-
-import sys
+import logging, sys
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Tuple
-import logging
 
-# ---- robuste Importe (direkt vs. -m) ----------------------------------------
-try:
-    # Wenn du mit `python -m src.main` startest
-    from core.loader import load_config
-    from core.scanner import find_sources
-    from utils.logger import setup_loggers
-except ImportError:
-    # Falls du `python src/main.py` direkt startest
-    THIS_DIR = Path(__file__).resolve().parent
-    if str(THIS_DIR) not in sys.path:
-        sys.path.append(str(THIS_DIR))
-    from core.loader import load_config
-    from core.scanner import find_sources
-    from utils.logger import setup_loggers
-# -----------------------------------------------------------------------------
+from loader import load_config
+from scanner import find_sources
 
-def _unpack_loggers(ret: Any) -> Tuple[logging.Logger, logging.Logger]:
-    """
-    Unterstützt beide Varianten:
-      - ein gemeinsamer Logger
-      - zwei Logger (auslesen, remux) + evtl. Pfad-Rückgaben
-    """
-    if isinstance(ret, logging.Logger):
-        return ret, ret
-    if isinstance(ret, tuple):
-        # häufig: (auslesen_logger, remux_logger, auslesen_log_path, remux_log_path)
-        if len(ret) >= 2 and isinstance(ret[0], logging.Logger) and isinstance(ret[1], logging.Logger):
-            return ret[0], ret[1]
-        # fallback: erster Logger für alles verwenden
-        for x in ret:
-            if isinstance(x, logging.Logger):
-                return x, x
-    # letzter Fallback: Root-Logger
-    return logging.getLogger("root"), logging.getLogger("root")
+# --------- Logging: eine gemeinsame Datei mit Kanal-Spalte ---------
 
+class _StageFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        # Falls kein 'stage' gesetzt ist (z.B. aus stdlib), Standard setzen
+        if not hasattr(record, "stage"):
+            record.stage = "GEN"
+        return True
 
-def main() -> int:
-    # 1) Konfiguration laden (legt Logs/Remux-Verzeichnisse NICHT automatisch an)
-    cfg = load_config(create_missing_dirs=True, check_path_existence=False)
+def _mk_pipeline_logger(logs_dir: Path, level: int) -> tuple[logging.LoggerAdapter, logging.LoggerAdapter, logging.LoggerAdapter, Path]:
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    combined_path = logs_dir / f"{ts}_pipeline.txt"
 
-    # 2) Logger einrichten
-    ret = setup_loggers(cfg.paths.logs_dir)
-    auslesen_log, remux_log = _unpack_loggers(ret)
+    base = logging.getLogger("pipeline")
+    base.handlers.clear()
+    base.setLevel(level)
 
-    # Laufzeitkontext protokollieren
+    fmt = logging.Formatter("%(asctime)s | %(levelname)-8s | %(stage)-7s | %(message)s", "%Y-%m-%d %H:%M:%S")
+    fh = logging.FileHandler(combined_path, encoding="utf-8")
+    fh.setLevel(level); fh.setFormatter(fmt); fh.addFilter(_StageFilter())
+
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setLevel(level); sh.setFormatter(fmt); sh.addFilter(_StageFilter())
+
+    base.addHandler(fh)
+    base.addHandler(sh)
+
+    # Drei kanalierte LoggerAdapters
+    auslesen = logging.LoggerAdapter(base, {"stage": "AUSLESEN"})
+    remux    = logging.LoggerAdapter(base, {"stage": "REMUX"})
+    rename   = logging.LoggerAdapter(base, {"stage": "RENAME"})
+    return auslesen, remux, rename, combined_path
+
+def _map_level(name: str) -> int:
+    return {
+        "CRITICAL": logging.CRITICAL,
+        "ERROR": logging.ERROR,
+        "WARNING": logging.WARNING,
+        "INFO": logging.INFO,
+        "DEBUG": logging.DEBUG,
+        "NOTSET": logging.NOTSET,
+    }.get(name.upper(), logging.INFO)
+
+# --------- Main ---------
+
+def main():
+    cfg = load_config("config/config.yaml")
+
+    # logger
+    level = _map_level(cfg.app.log_level)
+    auslesen_log, remux_log, rename_log, combined_path = _mk_pipeline_logger(cfg.paths.logs_dir, level)
+
+    # Header
     auslesen_log.info("=== START: Testlauf Logger + Scanner ===")
     auslesen_log.info(f"Base Root     : {cfg.paths.base_root}")
     auslesen_log.info(f"Transcode Dir : {cfg.paths.transcode_dir}")
     auslesen_log.info(f"Remux Dir     : {cfg.paths.remux_dir}")
     auslesen_log.info(f"Logs Dir      : {cfg.paths.logs_dir}")
-    auslesen_log.info(f"Dry-Run       : {cfg.behavior.dry_run}")
+    auslesen_log.info(f"Dry-Run       : {cfg.app.dry_run}")
     auslesen_log.info(f"TMDb enabled  : {cfg.tmdb.enabled}")
 
-    # 3) Scanner starten
+    # prüfen, ob transcode existiert
     if not cfg.paths.transcode_dir.exists():
         auslesen_log.error(f"Transcode-Verzeichnis existiert nicht: {cfg.paths.transcode_dir}")
         auslesen_log.info("=== ENDE: Keine Quellen ===")
         return 3
 
+    # Scannen
     sources = find_sources(cfg.paths.transcode_dir, auslesen_log)
-
     auslesen_log.info(f"Gefundene Quellen: {len(sources)}")
+
+    # hübsche Auflistung
     for i, s in enumerate(sources, 1):
         cat = s.get("category") or "-"
         kind = s.get("kind")
@@ -90,17 +88,21 @@ def main() -> int:
         disp = s.get("display")
         season = s.get("season")
         disc = s.get("disc")
-        auslesen_log.info(
-            f"[{i:03d}] cat={cat} | {kind} | season={season} | disc={disc} | "
-            f"display='{disp}' | path={path}"
+        disc_type = s.get("disc_type")
+        note = s.get("note")
+        line = (
+            f"[{i:03d}] cat={cat} | kind={kind} | disc_type={disc_type} | "
+            f"season={season} | disc={disc} | display='{disp}' | path={path}"
         )
+        if note:
+            line += f" | note={note}"
+        auslesen_log.info(line)
 
     auslesen_log.info("=== ENDE: Testlauf Logger + Scanner ===")
-    return 0
-
+    auslesen_log.info(f"(Gemeinsame Logdatei: {combined_path})")
 
 if __name__ == "__main__":
     try:
-        raise SystemExit(main())
+        main()
     except KeyboardInterrupt:
-        print("\nAbgebrochen (Ctrl+C).")
+        print("\nAbgebrochen (Ctrl+C).", file=sys.stderr)

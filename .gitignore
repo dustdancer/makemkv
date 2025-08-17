@@ -1,54 +1,43 @@
-# Python
+# ---- Python basics ----
 __pycache__/
-**/__pycache__/          # <- sichert wirklich alle Unterordner
 *.py[cod]
-*$py.class
-*.pyc
-
-# Envs & Tools
-.env
-.venv/
-venv/
-.env.*
-pip-wheel-metadata/
-.poetry/
-pip-cache/
-.mypy_cache/
-.pytest_cache/
-.pytype/
-.ipynb_checkpoints/
-
-# IDE/Editor
-.vscode/
-.idea/
-.vs/
-*.code-workspace
-
-# Logs, temp & outputs
-logs/
-*.log
-*.tmp
-tmp/
-_temp/
-cache/
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.eggs/
+.build/
 dist/
 build/
-*.egg-info/
+pip-wheel-metadata/
 
-# Dein Projekt
-secrets.txt
-secrets-*.txt
-!secrets.example.txt           # Beispiel darf versioniert werden
-data/usenet/complete/iso/logs/
-data/usenet/complete/iso/remux/
-# Falls du transcode/ remux nur auf dem Share hast, brauchst du diese Zeilen nicht
+# Virtual envs / tools
+.venv/
+venv/
+.env
+.env.*
+.pytest_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
 
-# OS
+# Editors/OS
+.vscode/
+.idea/
 .DS_Store
 Thumbs.db
 
-# Windows/VS Artefakte
-*.user
-*.suo
-*.VC.db
-*.VC.VC.opendb
+# Project logs & temp
+logs/
+*_logs/
+tmp/
+_tmp/
+*.log
+
+# Local config & secrets (examples stay checked in)
+config/config.yaml
+config/secrets.txt
+
+# Optional: notebooks, cache
+.ipynb_checkpoints/

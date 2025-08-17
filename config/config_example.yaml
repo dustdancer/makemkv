@@ -1,0 +1,73 @@
+# Beispiel-Konfiguration für MakeMKV Auto Remux
+# Kopiere diese Datei nach: config/config.yaml
+# und passe die Werte an deine Umgebung an.
+
+# --- Pfade (lokal oder gemapptes Netzlaufwerk) ---
+paths:
+  # Root deiner Struktur (nur Beispiel)
+  base_root: "C:\\path\\to\\baseroot"
+  transcode_dir: "C:\\path\\to\\transcode"
+  remux_dir:     "C:\\path\\to\\remux"
+  logs_dir:      "C:\\path\\to\\logs"
+
+# --- Netzwerk / Mount (optional) ---
+# Für einfache Setups auf Windows mit gemapptem Laufwerk: enable_mount = false
+network:
+  enable_mount: false
+  unc_root: "\\\\server\\share"          # nur falls enable_mount=true
+  win_drive_letter: "Z:"                 # nur falls enable_mount=true (Windows)
+  linux_mount_point: "/mnt/share"        # nur falls enable_mount=true (Linux)
+  linux_cifs_opts: "vers=3.0,iocharset=utf8,dir_mode=0775,file_mode=0664"
+
+# --- MakeMKV CLI ---
+makemkv:
+  # Typische Windows-Installationspfade (64-bit bevorzugt; Reihenfolge = Priorität)
+  win_paths:
+    - "C:\\Program Files (x86)\\MakeMKV\\makemkvcon64.exe"
+    - "C:\\Program Files\\MakeMKV\\makemkvcon64.exe"
+    - "C:\\Program Files (x86)\\MakeMKV\\makemkvcon.exe"
+    - "C:\\Program Files\\MakeMKV\\makemkvcon.exe"
+  linux_path: "makemkvcon"
+  # Zusätzliche Optionen (werden direkt an 'makemkv mkv' gehängt)
+  extra_opts:
+    - "--robot"
+    # - "--minlength=60"   # Beispiel: nur Titel >= 60s
+
+# --- Medienanalyse ---
+probe:
+  prefer_ffprobe: true
+  ffprobe_path: "ffprobe"
+  mediainfo_path: "mediainfo"
+
+# --- Verhalten & Heuristiken ---
+behavior:
+  delete_originals: false        # Originale nach Erfolg löschen
+  dry_run: true                  # Nichts verändern, nur loggen
+  log_retention_days: 14
+  # Heuristiken (Sekunden / Bytes):
+  trailer_max: 240               # <= 4 min ⇒ Trailer
+  episode_min: 1080              # 18 min
+  episode_max: 3900              # 65 min
+  tiny_file_bytes: 104857600     # 100 MiB
+  episode_tolerance: 0.15        # ±15 % um den Median
+  double_ep_tolerance: 0.12      # ±12 % um 2×Median
+  playall_mult_tol_min: 240      # min Toleranz (sek) für 3×, 4×, ...
+  playall_mult_tol_max: 480      # max Toleranz (sek)
+  playall_factor_min: 3.0        # >= 3× Median = Play-All
+  playall_factor_soft: 2.7       # weicher Schwellwert, wenn noch viele Episoden fehlen
+  size_tolerance: 0.22           # ±22 % um den Größen-Median (Fallback)
+
+# --- TMDb (optional) ---
+# API-Key kommt NICHT hierhin, sondern in secrets.txt (TMDB_API_KEY=...).
+tmdb:
+  enabled: true
+  language: "de-DE"
+  timeout: 8
+
+# --- Hooks / Integrationen (optional) ---
+hooks:
+  mkv_match:
+    enabled: false              # auf true, wenn mkv-episode-matcher genutzt werden soll
+    binary: "mkv-match"         # CLI im PATH
+    extra_args: []              # z. B. ["--prefer-opensubtitles"]
+    rename_to_schema: true      # Nachlauf: "Serie – SxxExx - Titel.mkv"

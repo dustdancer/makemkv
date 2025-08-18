@@ -1,139 +1,109 @@
 # -*- coding: utf-8 -*-
-"""
-Loader + Logger-Setup
-- YAML laden und in einfache Objekte mit Attributzugriff mappen
-- Stage-Logger (AUSLESEN | REMUX | RENAME) + Pipeline-Log
-"""
-
 from __future__ import annotations
+
 import logging
 from pathlib import Path
-from types import SimpleNamespace
-from datetime import datetime, timedelta
+from typing import Dict, Tuple, List
 import yaml
+from datetime import datetime
 
 
-def _to_namespace(d):
-    if isinstance(d, dict):
-        return SimpleNamespace(**{k: _to_namespace(v) for k, v in d.items()})
-    if isinstance(d, list):
-        return [ _to_namespace(x) for x in d ]
-    return d
+# ---------- kleine Utilities ----------
+
+def now_stamp() -> str:
+    return datetime.now().strftime("%Y-%m-%d-%H-%M")
 
 
-def _coerce_paths(cfg_ns):
-    # Pfade in Path konvertieren
-    cfg_ns.paths.base_root   = Path(cfg_ns.paths.base_root)
-    cfg_ns.paths.transcode_dir = Path(cfg_ns.paths.transcode_dir)
-    cfg_ns.paths.remux_dir   = Path(cfg_ns.paths.remux_dir)
-    cfg_ns.paths.logs_dir    = Path(cfg_ns.paths.logs_dir)
-    # MakeMKV Listen sicherstellen
-    if not isinstance(cfg_ns.makemkv.win_paths, list):
-        cfg_ns.makemkv.win_paths = [str(cfg_ns.makemkv.win_paths)]
-    if not isinstance(cfg_ns.makemkv.extra_opts, list):
-        cfg_ns.makemkv.extra_opts = [str(cfg_ns.makemkv.extra_opts)]
-    return cfg_ns
+def _mk_dir(p: Path) -> Path:
+    p.mkdir(parents=True, exist_ok=True)
+    return p
 
 
-def load_config() -> SimpleNamespace:
-    # config/config.yaml relativ zu Projektwurzel
-    here = Path(__file__).resolve()
-    cfg_path = here.parents[2] / "config" / "config.yaml"
+# ---------- Konfiguration laden ----------
+
+def load_config(cfg_path: Path) -> Dict:
+    """
+    Lädt config/config.yaml und gibt ein dict mit bereits auf Paths gemappten Pfaden zurück.
+    Erwartete Struktur siehe dein Beispiel.
+    """
     if not cfg_path.exists():
-        raise FileNotFoundError(f"Konfigurationsdatei nicht gefunden: {cfg_path}")
+        raise FileNotFoundError(f"Config nicht gefunden: {cfg_path}")
 
-    data = yaml.safe_load(cfg_path.read_text(encoding="utf-8", errors="replace"))
-    cfg = _to_namespace(data)
+    with cfg_path.open("r", encoding="utf-8") as f:
+        raw = yaml.safe_load(f) or {}
 
-    # Defaults absichern
-    if not hasattr(cfg, "behavior"):
-        cfg.behavior = SimpleNamespace()
-    if not hasattr(cfg.behavior, "delete_originals"):
-        cfg.behavior.delete_originals = False
+    # Defaults robust anwenden
+    app = raw.get("app", {})
+    paths = raw.get("paths", {})
+    tmdb = raw.get("tmdb", {})
 
-    # TMDb enabled ableiten, wenn Key gesetzt (falls in YAML disabled)
-    if hasattr(cfg, "tmdb"):
-        if getattr(cfg.tmdb, "enabled", False) and not getattr(cfg.tmdb, "timeout_seconds", None):
-            cfg.tmdb.timeout_seconds = 8
-        if not getattr(cfg.tmdb, "enabled", False):
-            # falls jemand API-Key gesetzt hat, trotzdem enabled lassen? Wir respektieren das YAML-Feld.
-            pass
+    # Basis/absolute Pfade herstellen (UNC/Windows okay)
+    base_root = Path(paths.get("base_root", "."))
+    transcode_dir = Path(paths.get("transcode_dir", base_root / "transcode"))
+    remux_dir = Path(paths.get("remux_dir", base_root / "remux"))
+    logs_dir = Path(paths.get("logs_dir", base_root / "logs"))
 
-    cfg = _coerce_paths(cfg)
-
-    # Log-Level normalisieren
-    lvl = str(getattr(cfg.app, "log_level", "INFO")).upper()
-    if lvl not in ("DEBUG", "INFO", "WARNING", "ERROR"):
-        lvl = "INFO"
-    cfg.app.log_level = lvl
-
+    cfg: Dict = {
+        "app": {
+            "log_level": str(app.get("log_level", "INFO")).upper(),
+            "dry_run": bool(app.get("dry_run", True)),
+        },
+        "paths": {
+            "base_root": base_root,
+            "transcode_dir": transcode_dir,
+            "remux_dir": remux_dir,
+            "logs_dir": _mk_dir(logs_dir),
+        },
+        "tmdb": {
+            "enabled": bool(tmdb.get("enabled", False)),
+            "language": tmdb.get("language", "de-DE"),
+            "timeout_seconds": int(tmdb.get("timeout_seconds", 8)),
+        },
+        "probe": raw.get("probe", {}),
+        "behavior": raw.get("behavior", {}),
+        "makemkv": raw.get("makemkv", {}),
+        "hooks": raw.get("hooks", {}),
+    }
     return cfg
 
 
-class _StageFilter(logging.Filter):
-    def __init__(self, stage: str):
-        super().__init__()
-        self.stage = stage
+# ---------- Logger ----------
 
-    def filter(self, record: logging.LogRecord) -> bool:
-        record.stage = self.stage
-        return True
+def setup_phase_logger(phase: str, logs_dir: Path, timestamp: str | None = None) -> Tuple[logging.Logger, Path]:
+    """
+    Erstellt einen Logger für eine Phase (AUSLESEN / REMUX / RENAME).
+    Format wie in deinen Beispielen: "… | AUSLESEN | …"
+    """
+    ts = timestamp or now_stamp()
+    log_path = logs_dir / f"{ts}_{phase.lower()}.txt"
 
+    logger = logging.getLogger(f"phase.{phase}")
+    logger.handlers.clear()
+    logger.setLevel(logging.DEBUG)
 
-def _make_logger(name: str, stage: str, file_path: Path, level: int, pipeline_handler: logging.Handler) -> logging.Logger:
-    lg = logging.getLogger(stage)  # bewusst: Stage als Name
-    lg.handlers.clear()
-    lg.setLevel(level)
+    fmt = logging.Formatter(f"%(asctime)s | %(levelname)-8s | {phase} | %(message)s", "%Y-%m-%d %H:%M:%S")
 
-    fmt = logging.Formatter("%(asctime)s | %(levelname)-8s | %(stage)s | %(message)s", "%Y-%m-%d %H:%M:%S")
-
-    fh = logging.FileHandler(file_path, encoding="utf-8")
-    fh.setLevel(level)
+    fh = logging.FileHandler(log_path, encoding="utf-8")
+    fh.setLevel(logging.DEBUG)
     fh.setFormatter(fmt)
-    fh.addFilter(_StageFilter(stage))
 
     sh = logging.StreamHandler()
-    sh.setLevel(level)
+    sh.setLevel(logging.INFO)
     sh.setFormatter(fmt)
-    sh.addFilter(_StageFilter(stage))
 
-    pipeline_handler.addFilter(_StageFilter(stage))
+    logger.addHandler(fh)
+    logger.addHandler(sh)
 
-    lg.addHandler(fh)
-    lg.addHandler(sh)
-    lg.addHandler(pipeline_handler)
-
-    return lg
+    return logger, log_path
 
 
-def setup_stage_loggers(logs_dir: Path, log_level: str = "INFO"):
-    logs_dir.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now().strftime("%Y-%m-%d-%H-%M")
-
-    auslesen_path = logs_dir / f"{ts}_auslesen.txt"
-    remux_path    = logs_dir / f"{ts}_remux.txt"
-    rename_path   = logs_dir / f"{ts}_rename.txt"
-    pipeline_path = logs_dir / f"{ts}_pipeline.txt"
-
-    level = getattr(logging, (log_level or "INFO").upper(), logging.INFO)
-
-    fmt = logging.Formatter("%(asctime)s | %(levelname)-8s | %(stage)s | %(message)s", "%Y-%m-%d %H:%M:%S")
-    pipeline_handler = logging.FileHandler(pipeline_path, encoding="utf-8")
-    pipeline_handler.setLevel(level)
-    pipeline_handler.setFormatter(fmt)
-
-    auslesen = _make_logger("auslesen", "AUSLESEN", auslesen_path, level, pipeline_handler)
-    remux    = _make_logger("remux",    "REMUX",    remux_path,    level, pipeline_handler)
-    rename   = _make_logger("rename",   "RENAME",   rename_path,   level, pipeline_handler)
-
-    # Logrotation (einfach: alte *.txt > retention löschen)
-    keep_days =  int(14)
-    for f in logs_dir.glob("*.txt"):
-        try:
-            age = datetime.now() - datetime.fromtimestamp(f.stat().st_mtime)
-            if age > timedelta(days=keep_days):
-                f.unlink(missing_ok=True)
-        except Exception:
-            pass
-
-    return auslesen, remux, rename, pipeline_path
+def write_pipeline_index(logs_dir: Path, timestamp: str, phase_files: List[Tuple[str, Path]]) -> Path:
+    """
+    Schreibt eine kleine Übersichtsdatei, die auf die einzelnen Phasen-Logs verweist.
+    """
+    index_path = logs_dir / f"{timestamp}_pipeline.txt"
+    lines = ["# Pipeline-Logs", ""]
+    for phase, p in phase_files:
+        lines.append(f"- {phase}: {p}")
+    index_path.write_text("\n".join(lines), encoding="utf-8")
+    return index_path
